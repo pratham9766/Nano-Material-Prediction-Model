@@ -1,0 +1,295 @@
+import pandas as pd
+import numpy as np
+import itertools
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler, LabelEncoder, MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+class NanomaterialPredictor:
+    def __init__(self, dataset_path):
+        # Elements from the dataset
+        self.elements = self.extract_unique_elements(dataset_path)
+        
+        # Load and preprocess data
+        (self.X_scaled, self.y_scaled, 
+         self.scaler_X, self.scaler_y, 
+         self.le_crystal, self.conductivity_map, 
+         self.mlb, self.element_columns) = self.load_and_preprocess_data(dataset_path)
+        
+        # Split the data
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            self.X_scaled, self.y_scaled, test_size=0.2, random_state=42
+        )
+        
+        # Train the model
+        self.model = self.build_and_train_model()
+    
+    def extract_unique_elements(self, file_path):
+        """Extract unique elements from the dataset"""
+        df = pd.read_csv(file_path)
+        elements = set()
+        for comp in df['Compound Composition']:
+            elements.update(comp.split(' + '))
+        return sorted(list(elements))
+    
+    def load_and_preprocess_data(self, file_path):
+        # Read the CSV file
+        df = pd.read_csv(file_path)
+        
+        # Remove duplicate rows
+        df = df.drop_duplicates()
+        
+        # Preprocess Composition
+        def extract_elements(composition):
+            return composition.split(' + ')
+        
+        # Extract unique elements
+        df['Elements'] = df['Compound Composition'].apply(extract_elements)
+        
+        # Create MultiLabelBinarizer for elements
+        mlb = MultiLabelBinarizer()
+        element_encoded = mlb.fit_transform(df['Elements'])
+        element_columns = mlb.classes_
+        
+        # Create DataFrame with element encoding
+        element_df = pd.DataFrame(
+            element_encoded, 
+            columns=[f'Element_{elem}' for elem in element_columns]
+        )
+        
+        # Handle Crystal Structure
+        df['Crystal Structure'] = df['Crystal Structure'].fillna('Unknown')
+        
+        # Encode categorical variables
+        le_crystal = LabelEncoder()
+        df['Crystal Structure Encoded'] = le_crystal.fit_transform(df['Crystal Structure'])
+        
+        # Convert Conductivity to Numeric
+        conductivity_map = {
+            'Low': 1, 
+            'Moderate': 2, 
+            'High': 3
+        }
+        df['Conductivity Numeric'] = df['Conductivity'].map(conductivity_map)
+        
+        # Combine features
+        features_df = pd.concat([
+            df[['Temperature (°C)', 'Pressure (MPa)', 'Crystal Structure Encoded', 'Lattice Parameter (Å)']],
+            element_df
+        ], axis=1)
+        
+        # Target variables
+        targets = [
+            'Band Gap (eV)', 
+            'Conductivity Numeric'
+        ]
+        
+        # Handle missing values
+        X = features_df.copy()
+        y = df[targets].copy()
+        
+        # Impute missing values
+        imputer_X = SimpleImputer(strategy='median')
+        imputer_y = SimpleImputer(strategy='median')
+        
+        X_imputed = imputer_X.fit_transform(X)
+        y_imputed = imputer_y.fit_transform(y)
+        
+        # Scale features
+        scaler_X = StandardScaler()
+        scaler_y = StandardScaler()
+        
+        X_scaled = scaler_X.fit_transform(X_imputed)
+        y_scaled = scaler_y.fit_transform(y_imputed)
+        
+        return (X_scaled, y_scaled, scaler_X, scaler_y, 
+                le_crystal, conductivity_map, mlb, element_columns)
+    
+    def build_and_train_model(self):
+        # Define the model architecture
+        model = Sequential([
+            Dense(128, activation='relu', input_shape=(self.X_train.shape[1],)),
+            Dropout(0.3),
+            Dense(64, activation='relu'),
+            Dropout(0.2),
+            Dense(32, activation='relu'),
+            Dense(self.y_train.shape[1], activation='linear')
+        ])
+        
+        # Compile the model
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+        
+        # Early stopping to prevent overfitting
+        early_stopping = EarlyStopping(
+            monitor='val_loss', 
+            patience=10, 
+            restore_best_weights=True
+        )
+        
+        # Train the model
+        model.fit(
+            self.X_train, self.y_train, 
+            epochs=250, 
+            batch_size=16, 
+            validation_split=0.2, 
+            callbacks=[early_stopping],
+            verbose=0
+        )
+        
+        return model
+    
+    def generate_novel_compositions(self, num_compositions=10, max_elements=3):
+        """
+        Generate novel nanomaterial compositions
+        
+        Args:
+            num_compositions (int): Number of compositions to generate
+            max_elements (int): Maximum number of elements in a composition
+        
+        Returns:
+            list: List of novel compositions
+        """
+        novel_compositions = []
+        
+        while len(novel_compositions) < num_compositions:
+            # Randomly choose number of elements
+            num_elem = np.random.randint(2, max_elements + 1)
+            
+            # Randomly select unique elements
+            composition = list(np.random.choice(self.elements, num_elem, replace=False))
+            
+            # Sort composition to ensure unique combinations
+            composition_sorted = sorted(composition)
+            
+            # Ensure composition is unique
+            if composition_sorted not in novel_compositions:
+                novel_compositions.append(composition_sorted)
+        
+        return novel_compositions
+    
+    def predict_novel_materials(self, novel_compositions):
+        """
+        Predict properties for novel nanomaterial compositions
+        
+        Args:
+            novel_compositions (list): List of novel compositions
+        
+        Returns:
+            list: Predicted properties for novel materials
+        """
+        # Prepare crystal structures and prediction list
+        crystal_structures = ['Wurtzite', 'Zinc Blende', 'Hexagonal', 'Cubic']
+        crystal_encoded = self.le_crystal.transform(crystal_structures)
+        predictions = []
+        
+        for composition in novel_compositions:
+            # Convert composition to string
+            comp_key = ' + '.join(composition)
+            
+            # Find best prediction across crystal structures
+            best_prediction = None
+            best_score = float('-inf')
+            
+            for crystal_struct in crystal_encoded:
+                # Use median values for parameters
+                temp = np.median(np.linspace(300, 1200, 5))
+                pressure = np.median(np.linspace(0.5, 2.0, 5))
+                lattice_param = np.median(np.linspace(3.0, 7.0, 5))
+                
+                # Prepare material features
+                material_features = self.prepare_material_features(
+                    temp, pressure, crystal_struct, lattice_param, composition
+                )
+                
+                # Predict properties
+                predicted_props = self.predict_material_properties(material_features)
+                
+                # Score prediction (prioritize higher band gap and conductivity)
+                score = predicted_props[0] * predicted_props[1]
+                
+                # Keep best prediction
+                if score > best_score:
+                    best_score = score
+                    best_prediction = {
+                        'Composition': comp_key,
+                        'Crystal Structure': self.le_crystal.inverse_transform([crystal_struct])[0],
+                        'Temperature (°C)': temp,
+                        'Pressure (MPa)': pressure,
+                        'Lattice Parameter (Å)': lattice_param,
+                        'Predicted Band Gap (eV)': predicted_props[0],
+                        'Predicted Conductivity': self.map_conductivity(predicted_props[1])
+                    }
+            
+            # Add best prediction for this composition
+            if best_prediction:
+                predictions.append(best_prediction)
+        
+        return predictions
+    
+    def prepare_material_features(self, temp, pressure, crystal_struct, lattice_param, elements):
+        """Prepare features for a material"""
+        # Encode elements
+        element_encoding = np.zeros(len(self.element_columns))
+        for elem in elements:
+            if elem in self.element_columns:
+                element_encoding[list(self.element_columns).index(elem)] = 1
+        
+        # Combine features
+        material_features = np.concatenate([
+            [temp, pressure, crystal_struct, lattice_param],
+            element_encoding
+        ])
+        
+        # Scale features
+        material_features_scaled = self.scaler_X.transform([material_features])
+        
+        return material_features_scaled
+    
+    def predict_material_properties(self, material_features):
+        """Predict properties for a material"""
+        # Predict scaled properties
+        predicted_scaled = self.model.predict(material_features, verbose=0)
+        
+        # Inverse transform to get actual values
+        predicted_props = self.scaler_y.inverse_transform(predicted_scaled)[0]
+        
+        return predicted_props
+    
+    def map_conductivity(self, conductivity_value):
+        """Map numeric conductivity to label"""
+        conductivity_map = {
+            1: 'Low',
+            2: 'Moderate', 
+            3: 'High'
+        }
+        return conductivity_map.get(round(conductivity_value), 'Unknown')
+
+def main():
+    # Initialize predictor
+    predictor = NanomaterialPredictor('Final_Extracted_Materials.csv')
+    
+    # Generate novel compositions
+    novel_compositions = predictor.generate_novel_compositions(num_compositions=20, max_elements=3)
+    
+    # Predict properties for novel compositions
+    predictions = predictor.predict_novel_materials(novel_compositions)
+    
+    # Display predictions
+    print("Novel Nanomaterial Predictions:")
+    for pred in predictions:
+        print("\nComposition:", pred['Composition'])
+        print("Crystal Structure:", pred['Crystal Structure'])
+        print("Temperature:", f"{pred['Temperature (°C)']:.1f} °C")
+        print("Pressure:", f"{pred['Pressure (MPa)']:.1f} MPa")
+        print("Lattice Parameter:", f"{pred['Lattice Parameter (Å)']:.2f} Å")
+        print("Predicted Band Gap:", f"{pred['Predicted Band Gap (eV)']:.2f} eV")
+        print("Predicted Conductivity:", pred['Predicted Conductivity'])
+        print("-" * 50)
+
+if __name__ == "__main__":
+    main()
